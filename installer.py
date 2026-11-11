@@ -27,8 +27,8 @@ from urllib.parse import urlsplit
 import paramiko
 
 APP_TITLE = "Telegram → 115 / Google Drive 一键部署器（CloudDrive2 共同传输层）"
-APP_VERSION = "1.5.0"
-LOCAL_BUILD_LABEL = "本地开发版"
+APP_VERSION = "1.6.0"
+LOCAL_BUILD_LABEL = "正式版"
 MANAGED_CD2_WEBDAV_URL = "http://clouddrive2:19798/dav"
 
 # VPS 预设：默认最小配置，宽裕配置保留给内存/硬盘更大的机器。

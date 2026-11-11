@@ -418,7 +418,7 @@ class MessageTests(unittest.TestCase):
 
     def test_app_title_names_the_shared_clouddrive2_layer(self) -> None:
         self.assertIn("CloudDrive2", APP_TITLE)
-        self.assertEqual(APP_VERSION, "1.5.0")
+        self.assertEqual(APP_VERSION, "1.6.0")
 
 
 def frame_visible(frame: tk.Frame) -> bool:

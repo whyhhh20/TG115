@@ -584,7 +584,8 @@ class DocumentationTests(unittest.TestCase):
                 "CloudDrive2 WebDAV",
                 "CD2_TARGET_PATH_B64",
                 "DEPLOY_CLOUDDRIVE2",
-                "本地开发版，尚未发布",
+                "v1.6.0 正式版",
+                "更新内容",
             ],
             "README.md",
         )
@@ -633,7 +634,7 @@ class DocumentationTests(unittest.TestCase):
             [
                 "不代表本轮修正后的验证",
                 "75 项自动化测试",
-                "Google Drive（经 CloudDrive2，本地开发版）",
+                "Google Drive（经 CloudDrive2，v1.6.0）",
                 "仍未验证",
                 "TG115_DESTINATION_LABEL=Google Drive",
             ],
@@ -718,7 +719,9 @@ class DocumentationTests(unittest.TestCase):
         self.assert_contains_all(
             text,
             [
-                "本地开发版（未发布",
+                "## v1.6.0",
+                "telegram转存",
+                "TRANSFER_MODE",
                 "DESTINATION_TYPE",
                 "Compose profile",
                 "两条路线都经过 CloudDrive2",

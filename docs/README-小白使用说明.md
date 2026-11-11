@@ -1,6 +1,6 @@
 # Telegram → 115 / Google Drive 一键部署器：小白使用说明
 
-> 版本：1.5.0 本地开发版（未发布）；适用电脑：Windows 10 / Windows 11 64 位；适用 VPS：
+> 版本：1.6.0 正式版；适用电脑：Windows 10 / Windows 11 64 位；适用 VPS：
 > Ubuntu 或 Debian 64 位；默认推荐 VPS：1 核 CPU、1GB 内存、20GB 硬盘（最小配置），
 > 宽裕配置建议内存至少 2GB、硬盘约 50GB。
 >
@@ -592,7 +592,7 @@ sudo /opt/tg115/manage.sh restart
 
 ## 十一、当前验证边界
 
-当前是本地开发版，尚未发布。已经在本地完成代码审查、自动化测试（含部署脚本的
+当前版本为 1.6.0。已经完成代码审查、自动化测试（含部署脚本的
 `--check-config` 配置校验、Compose 结构与文档检查）、ShellCheck 静态检查、Python 依赖
 漏洞扫描和容器镜像高危漏洞扫描。
 

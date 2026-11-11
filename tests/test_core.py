@@ -1105,7 +1105,7 @@ class UploadRecoveryTests(unittest.TestCase):
 
 class PayloadTests(unittest.TestCase):
     def test_windows_and_server_versions_match(self) -> None:
-        self.assertEqual(APP_VERSION, "1.5.0")
+        self.assertEqual(APP_VERSION, "1.6.0")
         self.assertEqual(__version__, APP_VERSION)
 
     def test_required_payload_files_exist(self) -> None:
