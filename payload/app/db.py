@@ -3,11 +3,22 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 from .naming import safe_file_name
+
+# 升级前创建的部署只有 CloudDrive2 一个目标。没有目标绑定的历史任务只允许
+# 继续走这个默认目标，避免切换网盘后把旧任务悄悄写到另一个网盘。
+LEGACY_DESTINATION = "clouddrive2"
+
+DESTINATION_COLUMNS = (
+    "destination_type",
+    "destination_target",
+    "destination_root",
+    "destination_account",
+)
 
 LOCAL_STATES = (
     "reserved",
@@ -26,6 +37,77 @@ GROWING_STATES = (
     "reserved",
     "downloading",
 )
+
+# 尚未结束、仍可能被自动调度写入网盘的状态。
+PENDING_STATES = (
+    "queued",
+    "reserved",
+    "downloading",
+    "streaming",
+    "downloaded",
+    "waiting_upload",
+    "uploading",
+    "verifying",
+    "finalizing",
+    "cleanup_pending",
+    "upload_failed_retained",
+    "verification_failed_retained",
+)
+
+
+def destination_values(destination: Mapping[str, Any] | None) -> dict[str, str]:
+    """Normalise a destination binding into the four persisted columns."""
+    data = dict(destination or {})
+    return {
+        column: str(data.get(column) or "") for column in DESTINATION_COLUMNS
+    }
+
+
+def destination_matches(
+    task: Mapping[str, Any], destination: Mapping[str, Any] | None
+) -> bool:
+    """Whether a persisted task may still write to the current destination.
+
+    A task without any stored type was created before destination binding
+    existed, so it may only continue on the legacy CloudDrive2 target. Tasks
+    that do carry a type must match the configured target/root/account exactly,
+    so changing the destination never silently relocates unfinished work.
+    """
+    current = destination_values(destination)
+    stored_type = str(task.get("destination_type") or "")
+    if not stored_type:
+        return current["destination_type"] == LEGACY_DESTINATION
+    if stored_type != current["destination_type"]:
+        return False
+    for column in ("destination_target", "destination_root", "destination_account"):
+        if str(task.get(column) or "") != current[column]:
+            return False
+    return True
+
+
+def _destination_sql(
+    destination: Mapping[str, Any] | None,
+) -> tuple[str, list[Any]]:
+    current = destination_values(destination)
+    clause = (
+        "(("
+        "(destination_type IS NULL OR destination_type = '') AND ? = ?"
+        ") OR ("
+        "destination_type = ?"
+        " AND COALESCE(destination_target, '') = ?"
+        " AND COALESCE(destination_root, '') = ?"
+        " AND COALESCE(destination_account, '') = ?"
+        "))"
+    )
+    params: list[Any] = [
+        LEGACY_DESTINATION,
+        current["destination_type"],
+        current["destination_type"],
+        current["destination_target"],
+        current["destination_root"],
+        current["destination_account"],
+    ]
+    return clause, params
 
 
 class TaskDB:
@@ -52,6 +134,10 @@ class TaskDB:
                     file_name TEXT NOT NULL,
                     file_size INTEGER NOT NULL CHECK(file_size >= 0),
                     transfer_mode TEXT NOT NULL DEFAULT 'local',
+                    destination_type TEXT,
+                    destination_target TEXT,
+                    destination_root TEXT,
+                    destination_account TEXT,
                     state TEXT NOT NULL,
                     local_path TEXT,
                     remote_path TEXT,
@@ -64,6 +150,7 @@ class TaskDB:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     next_retry_at REAL NOT NULL DEFAULT 0,
+                    started_at REAL,
                     UNIQUE(chat_id, message_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_tasks_state_created
@@ -83,10 +170,35 @@ class TaskDB:
                     "ALTER TABLE tasks ADD COLUMN transfer_mode TEXT "
                     "NOT NULL DEFAULT 'local'"
                 )
+            if "started_at" not in columns:
+                # 第一次真正开始传输的时间：只发一次“开始传输”通知，并计算用时。
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN started_at REAL")
+            for column in DESTINATION_COLUMNS:
+                if column not in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE tasks ADD COLUMN {column} TEXT"
+                    )
             self._conn.execute(
                 """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_sender_media
-                ON tasks(sender_id, media_key)
+                CREATE INDEX IF NOT EXISTS idx_tasks_destination
+                ON tasks(destination_type, state)
+                """
+            )
+            # 旧索引只按 (sender_id, media_key) 唯一，换网盘或换目录后重新转发
+            # 同一个文件会被判成重复并退回旧目标的旧任务，导致新目标永远收不到。
+            # 去重必须按完整目标绑定隔离，同时保留同一目标的去重。
+            self._conn.execute("DROP INDEX IF EXISTS idx_tasks_sender_media")
+            self._conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_sender_media_destination
+                ON tasks(
+                    sender_id,
+                    media_key,
+                    COALESCE(destination_type, ''),
+                    COALESCE(destination_target, ''),
+                    COALESCE(destination_root, ''),
+                    COALESCE(destination_account, '')
+                )
                 WHERE media_key IS NOT NULL
                 """
             )
@@ -108,16 +220,20 @@ class TaskDB:
         media_key: str | None = None,
         file_name: str,
         file_size: int,
+        destination: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         now = time.time()
+        binding = destination_values(destination)
         with self._lock:
             try:
                 cursor = self._conn.execute(
                     """
                     INSERT INTO tasks (
                         chat_id, message_id, sender_id, media_key, file_name,
-                        file_size, state, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                        file_size, destination_type, destination_target,
+                        destination_root, destination_account, state,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                     """,
                     (
                         chat_id,
@@ -126,6 +242,10 @@ class TaskDB:
                         media_key,
                         file_name,
                         file_size,
+                        binding["destination_type"] or None,
+                        binding["destination_target"] or None,
+                        binding["destination_root"] or None,
+                        binding["destination_account"] or None,
                         now,
                         now,
                     ),
@@ -140,12 +260,27 @@ class TaskDB:
                     (chat_id, message_id),
                 ).fetchone()
                 if row is None and media_key:
+                    # 只有同一目标绑定内的媒体才算重复；换网盘/目录后重新转发
+                    # 同一个文件必须能建立新任务。
                     row = self._conn.execute(
                         """
                         SELECT * FROM tasks
                         WHERE sender_id = ? AND media_key = ?
+                          AND COALESCE(destination_type, '') = ?
+                          AND COALESCE(destination_target, '') = ?
+                          AND COALESCE(destination_root, '') = ?
+                          AND COALESCE(destination_account, '') = ?
+                        ORDER BY id ASC
+                        LIMIT 1
                         """,
-                        (sender_id, media_key),
+                        (
+                            sender_id,
+                            media_key,
+                            binding["destination_type"],
+                            binding["destination_target"],
+                            binding["destination_root"],
+                            binding["destination_account"],
+                        ),
                     ).fetchone()
                 if row is None:
                     raise
@@ -166,14 +301,19 @@ class TaskDB:
         limit: int = 200,
         ready_only: bool = False,
         after_id: int = 0,
+        destination: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         state_values = tuple(states)
         if not state_values:
             return []
-        placeholders = ",".join("?" for _ in state_values)
+        placeholders = ", ".join("?" for _ in state_values)
         # placeholders are generated only from the tuple length; values stay bound.
         query = f"SELECT * FROM tasks WHERE state IN ({placeholders})"  # nosec B608
         params: list[Any] = list(state_values)
+        if destination is not None:
+            clause, clause_params = _destination_sql(destination)
+            query += f" AND {clause}"  # nosec B608
+            params.extend(clause_params)
         if after_id > 0:
             query += " AND id > ?"
             params.append(after_id)
@@ -197,14 +337,106 @@ class TaskDB:
                 ).fetchall()
             ]
 
-    def counts(self) -> dict[str, int]:
+    def counts(
+        self, destination: Mapping[str, Any] | None = None
+    ) -> dict[str, int]:
+        query = "SELECT state, COUNT(*) AS count FROM tasks"
+        params: list[Any] = []
+        if destination is not None:
+            clause, clause_params = _destination_sql(destination)
+            query += f" WHERE {clause}"  # nosec B608
+            params.extend(clause_params)
+        query += " GROUP BY state"
         with self._lock:
             return {
                 row["state"]: row["count"]
-                for row in self._conn.execute(
-                    "SELECT state, COUNT(*) AS count FROM tasks GROUP BY state"
-                ).fetchall()
+                for row in self._conn.execute(query, params).fetchall()
             }
+
+    def pending_mismatch_count(
+        self, destination: Mapping[str, Any] | None
+    ) -> int:
+        """Count unfinished tasks that belong to another destination."""
+        if destination is None:
+            return 0
+        placeholders = ", ".join("?" for _ in PENDING_STATES)
+        clause, clause_params = _destination_sql(destination)
+        query = (
+            f"SELECT COUNT(*) AS count FROM tasks "  # nosec B608
+            f"WHERE state IN ({placeholders}) AND NOT COALESCE({clause}, 0)"
+        )
+        params: list[Any] = list(PENDING_STATES) + clause_params
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+            return int(row["count"]) if row is not None else 0
+
+    def bind_unbound_tasks(
+        self, destination: Mapping[str, Any] | None
+    ) -> int:
+        """Adopt tasks created before destination binding existed.
+
+        Only called by the service for the legacy CloudDrive2 destination so an
+        upgrade keeps resuming its own unfinished tasks. A task without a
+        stored type can only have come from the CloudDrive2-only builds, so
+        any other destination refuses to claim it instead of relocating
+        old work.
+        """
+        binding = destination_values(destination)
+        if binding["destination_type"] != LEGACY_DESTINATION:
+            return 0
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE tasks
+                SET destination_type = ?, destination_target = ?,
+                    destination_root = ?, destination_account = ?
+                WHERE destination_type IS NULL OR destination_type = ''
+                """,
+                (
+                    binding["destination_type"],
+                    binding["destination_target"] or None,
+                    binding["destination_root"] or None,
+                    binding["destination_account"] or None,
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    def adopt_legacy_account(
+        self, destination: Mapping[str, Any] | None
+    ) -> int:
+        """Stamp the account fingerprint on tasks recorded before it existed.
+
+        Older builds stored the destination type/target/root but no account
+        identity. Only rows whose type, target and root already match the
+        current destination are upgraded, so this can never move work onto a
+        different disk; tasks bound to another account keep their own value and
+        stay blocked.
+        """
+        binding = destination_values(destination)
+        if binding["destination_type"] != LEGACY_DESTINATION:
+            # 只有升级前的 CloudDrive2 目标可以补写指纹。Google Drive 任务来自
+            # 旧版直连实现，补写会把它们悄悄改成 CD2 任务，必须拒绝。
+            return 0
+        if not binding["destination_account"]:
+            return 0
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE tasks
+                SET destination_account = ?
+                WHERE destination_type = ?
+                  AND COALESCE(destination_target, '') = ?
+                  AND COALESCE(destination_root, '') = ?
+                  AND (destination_account IS NULL OR destination_account = '')
+                """,
+                (
+                    binding["destination_account"],
+                    binding["destination_type"],
+                    binding["destination_target"],
+                    binding["destination_root"],
+                ),
+            )
+            return int(cursor.rowcount or 0)
 
     def used_local_bytes(self) -> int:
         placeholders = ",".join("?" for _ in LOCAL_STATES)
@@ -227,7 +459,13 @@ class TaskDB:
         budget_bytes: int,
         current_free_bytes: int,
         minimum_free_bytes: int,
+        always_stream: bool = False,
     ) -> tuple[bool, str]:
+        """放行一个排队任务。
+
+        流式任务不占本地预算，但仍受真实磁盘安全线约束（CloudDrive2 会缓存）。
+        ``always_stream`` 对应 TRANSFER_MODE=stream：所有文件都走流式。
+        """
         placeholders = ",".join("?" for _ in LOCAL_STATES)
         local_sum_query = (
             "SELECT COALESCE(SUM(file_size), 0) AS total "  # nosec B608
@@ -262,7 +500,7 @@ class TaskDB:
                 ).fetchone()
                 pending_growth = int(growth_row["total"])
                 size = int(task["file_size"])
-                if size > budget_bytes:
+                if always_stream or size > budget_bytes:
                     if current_free_bytes <= minimum_free_bytes:
                         reason = "等待真实磁盘空间恢复后使用流式模式"
                         self._conn.execute(
@@ -284,6 +522,8 @@ class TaskDB:
                         (time.time(), task_id),
                     )
                     self._conn.execute("COMMIT")
+                    if always_stream:
+                        return True, "TRANSFER_MODE=stream，使用流式模式"
                     return True, "单文件超过本地预算，已切换流式模式"
                 if used + size > budget_bytes:
                     reason = "等待本地临时空间额度"
@@ -337,6 +577,7 @@ class TaskDB:
             "error",
             "wait_reason",
             "next_retry_at",
+            "started_at",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -391,6 +632,17 @@ class TaskDB:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def confirm_delivery(
+        self, task_id: int
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Destination-neutral alias for :meth:`confirm_115`.
+
+        The recorded confirmation means "the user saw the finished file in the
+        destination's own client"; the historical method name is kept so older
+        callers and tests keep working.
+        """
+        return self.confirm_115(task_id)
 
     def recover(self, download_dir: Path) -> dict[str, int]:
         recovered = {"queued": 0, "waiting_upload": 0, "failed": 0}

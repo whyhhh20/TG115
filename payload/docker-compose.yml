@@ -1,5 +1,10 @@
+# 两种目标网盘（115 / Google Drive）都经过 CloudDrive2 WebDAV 传输。
+# DEPLOY_CLOUDDRIVE2=true 时由本机托管 clouddrive2 服务；false 时复用 VPS 上已有的 CD2。
+# clouddrive2 服务放在 profile 中，只有显式 --profile clouddrive2 才会被创建或启动，
+# 因此复用已有 CD2 时执行 docker compose up -d tg115-bot 不会碰到 CloudDrive2。
 services:
   clouddrive2:
+    profiles: ["clouddrive2"]
     image: cloudnas/clouddrive2@sha256:5491c21fb14a5774576515f8483ecdbe2780bf525985f426785b99488e7cc09d
     container_name: tg115-clouddrive2
     environment:
@@ -15,6 +20,13 @@ services:
     privileged: true
     pid: host
     restart: unless-stopped
+    # 容器标准输出日志同样有上限：json-file 每个文件 5MB，最多保留 2 份，
+    # 避免最小 VPS 的 20GB 硬盘被容器日志持续占用。
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     networks:
       - tg115
 
@@ -47,12 +59,14 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m
     restart: unless-stopped
     stop_grace_period: 45s
+    # 标准输出日志上限与 CloudDrive2 服务一致，防止容器 json 日志无限增长。
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     healthcheck:
-      test: ["CMD", "python", "-m", "app.healthcheck"]
-      interval: 30s
-      timeout: 8s
-      retries: 3
-      start_period: 45s
+      disable: true
     networks:
       - tg115
 

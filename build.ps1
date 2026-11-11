@@ -22,7 +22,7 @@ try {
         & $env:TG115_BUILD_PYTHON -m PyInstaller @PyInstallerArgs
     }
     elseif (Get-Command uv -ErrorAction SilentlyContinue) {
-        & uv run --with-requirements requirements-build.txt `
+        & uv run --python 3.13 --with-requirements requirements-build.txt `
             python -m PyInstaller @PyInstallerArgs
     }
     else {

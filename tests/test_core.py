@@ -1199,9 +1199,16 @@ class PayloadTests(unittest.TestCase):
 
     def test_docker_build_context_excludes_secrets_and_runtime_data(self) -> None:
         dockerignore = (PAYLOAD / ".dockerignore").read_text(encoding="utf-8")
+        lines = dockerignore.splitlines()
+        # 白名单必须原样、按顺序位于开头：先全部排除，再只放回构建所需文件。
         self.assertEqual(
-            dockerignore.splitlines(),
+            lines[:5],
             ["*", "!Dockerfile", "!requirements.txt", "!app/", "!app/**"],
+        )
+        # 之后只允许追加字节码缓存排除规则（后写的规则优先，才能把它们从 app/ 中剔除），
+        # 不能再放回任何别的文件。
+        self.assertLessEqual(
+            set(lines[5:]), {"**/__pycache__", "**/*.pyc", "**/*.pyo"}
         )
         self.assertNotIn("!.env", dockerignore)
         self.assertNotIn("!downloads", dockerignore)

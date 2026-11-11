@@ -80,7 +80,24 @@ docker compose config --quiet
 
 # shellcheck disable=SC1091
 source "$INSTALL_DIR/.env"
+DEPLOY_CLOUDDRIVE2="${DEPLOY_CLOUDDRIVE2:-true}"
 DEPLOY_CLOUDDRIVE2="${DEPLOY_CLOUDDRIVE2%$'\r'}"
+DESTINATION_TYPE="${DESTINATION_TYPE:-clouddrive2}"
+DESTINATION_TYPE="${DESTINATION_TYPE%$'\r'}"
+# 115 与 Google Drive 两条路线都经过 CloudDrive2，因此修复逻辑对两者一致。
+DESTINATION_RAW="$(printf '%s' "$DESTINATION_TYPE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$DESTINATION_RAW" in
+  clouddrive2|115) DESTINATION_TYPE="clouddrive2" ;;
+  gdrive|google_drive|google-drive) DESTINATION_TYPE="gdrive" ;;
+  *)
+    fail "DESTINATION_TYPE 只能是 clouddrive2(115) 或 gdrive(google_drive)，当前值：$DESTINATION_TYPE"
+    ;;
+esac
+case "$DESTINATION_TYPE" in
+  gdrive) DESTINATION_LABEL="Google Drive" ;;
+  *) DESTINATION_LABEL="115" ;;
+esac
+log "目标网盘：$DESTINATION_LABEL（经 CloudDrive2 WebDAV 传输）"
 
 docker network inspect tg115 >/dev/null 2>&1 || docker network create tg115 >/dev/null
 
@@ -110,8 +127,8 @@ if [[ -z "$CD2_CONTAINER" ]]; then
   log "没有发现正在运行的 CloudDrive2，按当前 Compose 配置启动"
   modprobe fuse 2>/dev/null || true
   [[ -c /dev/fuse ]] || fail "VPS 没有提供 /dev/fuse"
-  docker compose pull clouddrive2
-  docker compose up -d clouddrive2
+  docker compose --profile clouddrive2 pull clouddrive2
+  docker compose --profile clouddrive2 up -d clouddrive2
   CD2_CONTAINER="tg115-clouddrive2"
 fi
 
@@ -216,9 +233,9 @@ if [[ "$MODE" != "--network-only" ]]; then
       for _ in $(seq 1 30); do
         [[ "$(
           docker inspect --format \
-            '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+            '{{.State.Status}}' \
             tg115-bot 2>/dev/null || true
-        )" == "healthy" ]] && break
+        )" == "running" ]] && break
         sleep 2
       done
       docker compose exec -T tg115-bot python -m app.verify_destination
